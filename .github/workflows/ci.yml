@@ -36,6 +36,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Copy application to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "app,tests,Dockerfile,requirements.txt"
+          target: "~/CloudDeploy"
+          overwrite: true
+
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.2.2
         with:
@@ -45,9 +58,8 @@ jobs:
 
           script: |
             cd ~/CloudDeploy
-            git pull origin master
 
-            COMMIT=$(git rev-parse --short HEAD)
+            COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
             docker stop clouddeploy-app || true
             docker rm clouddeploy-app || true
