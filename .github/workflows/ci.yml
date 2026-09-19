@@ -46,9 +46,13 @@ jobs:
           script: |
             cd ~/CloudDeploy
             git pull origin master
+
+            COMMIT=$(git rev-parse --short HEAD)
+
             docker stop clouddeploy-app || true
             docker rm clouddeploy-app || true
-            docker build -t clouddeploy .
-            docker run -d -p 5000:5000 --name clouddeploy-app clouddeploy
-            echo "Deployed commit:"
-            git rev-parse --short HEAD
+
+            docker build -t clouddeploy:$COMMIT .
+            docker run -d -p 5000:5000 --name clouddeploy-app clouddeploy:$COMMIT
+
+            echo "Deployed commit: $COMMIT"
