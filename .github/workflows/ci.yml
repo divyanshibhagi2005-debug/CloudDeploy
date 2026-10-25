@@ -75,7 +75,6 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           envs: COMMIT_ID
-
           script: |
             set -e
             cd ~/CloudDeploy
@@ -83,14 +82,45 @@ jobs:
             SHORT_COMMIT=${COMMIT_ID:0:7}
             IMAGE="clouddeploy:$SHORT_COMMIT"
 
-            # Build before replacing the running container
+            # Build the new image before touching production
             docker build -t "$IMAGE" .
 
-            # Start the replacement container on a temporary port
-            docker rm -f clouddeploy-candidate || true
-            docker run -d --name clouddeploy-candidate -p 5001:5000 "$IMAGE"
+            # Record the current production image for rollback
+            PREVIOUS_IMAGE=$(docker inspect --format='{{.Config.Image}}' clouddeploy-app)
+            echo "Previous production image: $PREVIOUS_IMAGE"
 
-            # Verify the candidate API responds
+            # Ensure persistent volumes exist
+            docker volume create clouddeploy-data >/dev/null
+            docker volume create clouddeploy-candidate-data >/dev/null
+
+            # Back up the production database before deployment
+            docker run --rm \
+              -v clouddeploy-data:/data:ro \
+              -v "$HOME:/backup" \
+              python:3.13-slim \
+              python -c "import sqlite3; src=sqlite3.connect('file:/data/tasks.db?mode=ro', uri=True); dst=sqlite3.connect('/backup/clouddeploy-tasks-predeploy.db'); src.backup(dst); dst.close(); src.close()"
+
+            # Verify the backup file was created
+            test -s "$HOME/clouddeploy-tasks-predeploy.db"
+            echo "Production database backup verified"
+
+            # Verify that the production database is readable
+            docker run --rm \
+              -v clouddeploy-data:/data:ro \
+              -e DATABASE_PATH=/data/tasks.db \
+              "$IMAGE" \
+              python -c "import sqlite3; c=sqlite3.connect('file:/data/tasks.db?mode=ro', uri=True); print('Production tasks:', c.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]); c.close()"
+
+            # Start the candidate with its own test database volume
+            docker rm -f clouddeploy-candidate || true
+            docker run -d \
+              --name clouddeploy-candidate \
+              -p 127.0.0.1:5001:5000 \
+              -v clouddeploy-candidate-data:/data \
+              -e DATABASE_PATH=/data/tasks.db \
+              "$IMAGE"
+
+            # Wait for candidate health check
             for i in $(seq 1 15); do
               if curl -fsS http://localhost:5001/health >/dev/null; then
                 break
@@ -98,21 +128,55 @@ jobs:
               sleep 2
             done
 
+            # Stop deployment if candidate health check fails
             if ! curl -fsS http://localhost:5001/health >/dev/null; then
               docker logs clouddeploy-candidate
               docker rm -f clouddeploy-candidate || true
               exit 1
             fi
 
-            # Replace the current container only after the candidate passes
+            # Verify the candidate tasks API responds
+            if ! curl -fsS http://localhost:5001/tasks >/dev/null; then
+              docker logs clouddeploy-candidate
+              docker rm -f clouddeploy-candidate || true
+              exit 1
+            fi
+
+            # Candidate passed checks; remove it
             docker rm -f clouddeploy-candidate
-            docker stop clouddeploy-app || true
-            docker rm clouddeploy-app || true
+
+            # Replace production with the new image
+            docker stop clouddeploy-app
+            docker rm clouddeploy-app
 
             docker run -d \
               --restart unless-stopped \
               -p 5000:5000 \
               --name clouddeploy-app \
+              -v clouddeploy-data:/data \
+              -e DATABASE_PATH=/data/tasks.db \
               "$IMAGE"
 
-            echo "Deployed commit: $SHORT_COMMIT"
+            # Verify production health after startup
+            for i in $(seq 1 15); do
+              if curl -fsS http://localhost:5000/health >/dev/null; then
+                echo "Deployed commit: $SHORT_COMMIT"
+                exit 0
+              fi
+              sleep 2
+            done
+
+            # Collect logs and roll back if new production fails
+            docker logs clouddeploy-app || true
+            docker rm -f clouddeploy-app || true
+
+            docker run -d \
+              --restart unless-stopped \
+              -p 5000:5000 \
+              --name clouddeploy-app \
+              -v clouddeploy-data:/data \
+              -e DATABASE_PATH=/data/tasks.db \
+              "$PREVIOUS_IMAGE"
+
+            echo "Rollback attempted to image: $PREVIOUS_IMAGE"
+            exit 1
