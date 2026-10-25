@@ -1,13 +1,18 @@
 
 import os
+import json
 import sqlite3
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, jsonify, request, send_from_directory
 
 app = Flask(__name__)
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend-dist"
+
 DATABASE_PATH = Path(
     os.environ.get(
         "DATABASE_PATH",
@@ -15,13 +20,22 @@ DATABASE_PATH = Path(
     )
 )
 
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+CLOUDWATCH_NAMESPACE = "CloudDeploy/EC2"
+CLOUDWATCH_HOST = os.environ.get(
+    "CLOUDWATCH_HOST",
+    "ip-172-31-31-204.ec2.internal"
+)
+CLOUDWATCH_ALARM_NAME = "CloudDeploy-HighCPU"
+
+cloudwatch = boto3.client("cloudwatch", region_name=AWS_REGION)
+
 
 def get_db():
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DATABASE_PATH)
     connection.row_factory = sqlite3.Row
     return connection
-
 
 
 def init_db():
@@ -35,10 +49,8 @@ def init_db():
         """)
 
 
-
 init_db()
 
-import json
 
 def import_tasks_from_json(backup_path):
     backup_path = Path(backup_path)
@@ -59,7 +71,10 @@ def import_tasks_from_json(backup_path):
 
         for task in tasks:
             connection.execute(
-                "INSERT OR IGNORE INTO tasks (id, title, completed) VALUES (?, ?, ?)",
+                """
+                INSERT OR IGNORE INTO tasks (id, title, completed)
+                VALUES (?, ?, ?)
+                """,
                 (
                     task["id"],
                     task["title"],
@@ -68,6 +83,55 @@ def import_tasks_from_json(backup_path):
             )
 
 
+def get_latest_metric(metric_name, dimensions, namespace=CLOUDWATCH_NAMESPACE):
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(minutes=30)
+
+    response = cloudwatch.get_metric_statistics(
+        Namespace=namespace,
+        MetricName=metric_name,
+        Dimensions=dimensions,
+        StartTime=start_time,
+        EndTime=end_time,
+        Period=60,
+        Statistics=["Average"]
+    )
+
+    datapoints = response.get("Datapoints", [])
+
+    if not datapoints:
+        return None
+
+    latest = max(datapoints, key=lambda point: point["Timestamp"])
+    return round(latest["Average"], 2)
+
+
+def get_metric_dimensions(metric_name):
+    response = cloudwatch.list_metrics(
+        Namespace=CLOUDWATCH_NAMESPACE,
+        MetricName=metric_name
+    )
+
+    for metric in response.get("Metrics", []):
+        dimensions = metric.get("Dimensions", [])
+        dimension_values = {
+            dimension["Name"]: dimension["Value"]
+            for dimension in dimensions
+        }
+
+        if dimension_values.get("host") == CLOUDWATCH_HOST:
+            return dimensions
+
+    return None
+
+
+def get_disk_metric():
+    dimensions = get_metric_dimensions("disk_used_percent")
+
+    if not dimensions:
+        return None
+
+    return get_latest_metric("disk_used_percent", dimensions)
 
 
 @app.route("/")
@@ -112,7 +176,11 @@ def get_tasks():
 def add_task():
     data = request.get_json(silent=True)
 
-    if not data or not isinstance(data.get("title"), str) or not data["title"].strip():
+    if (
+        not data
+        or not isinstance(data.get("title"), str)
+        or not data["title"].strip()
+    ):
         return jsonify({"error": "A valid task title is required"}), 400
 
     title = data["title"].strip()
@@ -131,6 +199,62 @@ def add_task():
     }), 201
 
 
+@app.route("/cloudwatch/metrics", methods=["GET"])
+def get_cloudwatch_metrics():
+    try:
+        host_dimensions = [
+            {"Name": "host", "Value": CLOUDWATCH_HOST}
+        ]
+
+        cpu_dimensions = host_dimensions + [
+            {"Name": "cpu", "Value": "cpu-total"}
+        ]
+
+        memory = get_latest_metric(
+            "mem_used_percent",
+            host_dimensions
+        )
+
+        idle_cpu = get_latest_metric(
+            "cpu_usage_idle",
+            cpu_dimensions
+        )
+
+        cpu = round(100 - idle_cpu, 2) if idle_cpu is not None else None
+        disk = get_disk_metric()
+
+        alarm_response = cloudwatch.describe_alarms(
+            AlarmNames=[CLOUDWATCH_ALARM_NAME]
+        )
+
+        alarms = [
+            {
+                "name": alarm["AlarmName"],
+                "state": alarm["StateValue"],
+                "reason": alarm.get("StateReason", "")
+            }
+            for alarm in alarm_response.get("MetricAlarms", [])
+        ]
+
+        return jsonify({
+            "status": "success",
+            "region": AWS_REGION,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "cpu_percent": cpu,
+            "memory_percent": memory,
+            "disk_percent": disk,
+            "alarms": alarms
+        })
+
+    except (BotoCoreError, ClientError):
+        app.logger.exception("CloudWatch metrics request failed")
+
+        return jsonify({
+            "status": "error",
+            "message": "Unable to retrieve CloudWatch metrics"
+        }), 502
+
+
 if __name__ == "__main__":
     import sys
 
@@ -139,4 +263,3 @@ if __name__ == "__main__":
         print("Task import completed.")
     else:
         app.run(host="0.0.0.0", port=5000)
-
