@@ -24,7 +24,8 @@ COPY tests ./tests
 
 # Include the compiled React frontend
 COPY --from=frontend-build /frontend/dist ./frontend-dist
-
+VOLUME ["/data"]
+ENV DATABASE_PATH=/data/tasks.db
 EXPOSE 5000
 
 CMD ["python", "app/main.py"]
