@@ -1,3 +1,4 @@
+
 name: CloudDeploy CI/CD
 
 on:
@@ -22,7 +23,22 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install dependencies
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Install Python dependencies
         run: pip install -r requirements.txt
 
       - name: Run tests
@@ -32,6 +48,7 @@ jobs:
         run: docker build -t clouddeploy .
 
   deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     needs: test
     runs-on: ubuntu-latest
 
@@ -45,7 +62,7 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          source: "app,tests,Dockerfile,requirements.txt"
+          source: "app,tests,frontend,Dockerfile,requirements.txt"
           target: "~/CloudDeploy"
           overwrite: true
 
@@ -60,14 +77,42 @@ jobs:
           envs: COMMIT_ID
 
           script: |
+            set -e
             cd ~/CloudDeploy
 
             SHORT_COMMIT=${COMMIT_ID:0:7}
+            IMAGE="clouddeploy:$SHORT_COMMIT"
 
+            # Build before replacing the running container
+            docker build -t "$IMAGE" .
+
+            # Start the replacement container on a temporary port
+            docker rm -f clouddeploy-candidate || true
+            docker run -d --name clouddeploy-candidate -p 5001:5000 "$IMAGE"
+
+            # Verify the candidate API responds
+            for i in $(seq 1 15); do
+              if curl -fsS http://localhost:5001/health >/dev/null; then
+                break
+              fi
+              sleep 2
+            done
+
+            if ! curl -fsS http://localhost:5001/health >/dev/null; then
+              docker logs clouddeploy-candidate
+              docker rm -f clouddeploy-candidate || true
+              exit 1
+            fi
+
+            # Replace the current container only after the candidate passes
+            docker rm -f clouddeploy-candidate
             docker stop clouddeploy-app || true
             docker rm clouddeploy-app || true
 
-            docker build -t clouddeploy:$SHORT_COMMIT .
-            docker run -d -p 5000:5000 --name clouddeploy-app clouddeploy:$SHORT_COMMIT
+            docker run -d \
+              --restart unless-stopped \
+              -p 5000:5000 \
+              --name clouddeploy-app \
+              "$IMAGE"
 
             echo "Deployed commit: $SHORT_COMMIT"
