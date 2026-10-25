@@ -1,5 +1,6 @@
 
 import { useEffect, useState } from 'react'
+import type { FormEvent, ReactNode } from 'react'
 import {
   Activity,
   ArrowUpRight,
@@ -20,6 +21,8 @@ import {
   Server,
   ShieldCheck,
   X,
+  Clock,
+  AlertCircle,
 } from 'lucide-react'
 import {
   Area,
@@ -64,6 +67,26 @@ type ChartPoint = {
   memory: number | null
 }
 
+type WorkflowRun = {
+  id: number
+  name: string
+  status: string | null
+  conclusion: string | null
+  branch: string | null
+  commit: string
+  html_url: string
+  created_at: string
+  updated_at: string
+  run_number: number
+}
+
+type WorkflowResponse = {
+  status: 'success' | 'error'
+  total_count: number
+  workflow_runs: WorkflowRun[]
+  message?: string
+}
+
 const initialTasks: Task[] = [
   { id: 1, title: 'Learn Docker', completed: false },
   { id: 2, title: 'Deploy on AWS', completed: false },
@@ -101,6 +124,12 @@ function App() {
   const [metricsError, setMetricsError] = useState('')
   const [chartData, setChartData] = useState<ChartPoint[]>([])
 
+  const [workflowRuns, setWorkflowRuns] = useState<WorkflowRun[]>([])
+  const [workflowTotal, setWorkflowTotal] = useState(0)
+  const [workflowsLoading, setWorkflowsLoading] = useState(false)
+  const [workflowsError, setWorkflowsError] = useState('')
+  const [lastWorkflowUpdate, setLastWorkflowUpdate] = useState<string | null>(null)
+
   async function loadCloudMetrics() {
     setMetricsLoading(true)
     setMetricsError('')
@@ -110,9 +139,7 @@ function App() {
         cache: 'no-store',
       })
 
-      if (!response.ok) {
-        throw new Error('CloudWatch request failed')
-      }
+      if (!response.ok) throw new Error('CloudWatch request failed')
 
       const data: CloudWatchMetrics = await response.json()
 
@@ -144,11 +171,7 @@ function App() {
   async function checkHealth() {
     try {
       const response = await fetch(`${API}/health`)
-
-      if (!response.ok) {
-        throw new Error('Health check failed')
-      }
-
+      if (!response.ok) throw new Error('Health check failed')
       setApiStatus('online')
     } catch {
       setApiStatus('offline')
@@ -160,11 +183,8 @@ function App() {
     setTaskError('')
 
     try {
-      const response = await fetch(`${API}/tasks`)
-
-      if (!response.ok) {
-        throw new Error('Unable to load tasks')
-      }
+      const response = await fetch(`${API}/tasks`, { cache: 'no-store' })
+      if (!response.ok) throw new Error('Unable to load tasks')
 
       const data: Task[] = await response.json()
       setTasks(data)
@@ -177,11 +197,49 @@ function App() {
     }
   }
 
-  async function addTask(event: React.FormEvent<HTMLFormElement>) {
+  async function loadWorkflows() {
+    setWorkflowsLoading(true)
+    setWorkflowsError('')
+
+    try {
+      const response = await fetch(`${API}/github/workflows`, {
+        cache: 'no-store',
+      })
+
+      if (!response.ok) {
+        if (response.status === 503) {
+          throw new Error('GitHub token is not configured on the backend.')
+        }
+        if (response.status === 502) {
+          throw new Error('GitHub could not be reached. Check the backend logs.')
+        }
+        throw new Error(`Unable to load workflow history (${response.status}).`)
+      }
+
+      const data: WorkflowResponse = await response.json()
+
+      if (data.status !== 'success') {
+        throw new Error(data.message || 'GitHub returned an error.')
+      }
+
+      setWorkflowRuns(data.workflow_runs ?? [])
+      setWorkflowTotal(data.total_count ?? 0)
+      setLastWorkflowUpdate(new Date().toISOString())
+    } catch (error) {
+      setWorkflowsError(
+        error instanceof Error
+          ? error.message
+          : 'Could not load GitHub Actions history.',
+      )
+    } finally {
+      setWorkflowsLoading(false)
+    }
+  }
+
+  async function addTask(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
 
     const title = newTask.trim()
-
     if (!title) return
 
     setTaskError('')
@@ -193,19 +251,31 @@ function App() {
         body: JSON.stringify({ title }),
       })
 
-      if (!response.ok) {
-        throw new Error('Could not create task')
-      }
+      if (!response.ok) throw new Error('Could not create task')
 
       const task: Task = await response.json()
-
       setTasks((current) => [...current, task])
       setNewTask('')
       setNotice('Task added successfully')
-
       window.setTimeout(() => setNotice(''), 2500)
     } catch {
       setTaskError('Could not add task. Check that the Flask API is running.')
+    }
+  }
+
+  async function refreshCurrentPage() {
+    void checkHealth()
+
+    if (page === 'Overview' || page === 'Task Manager') {
+      void loadTasks()
+    }
+
+    if (page === 'Overview' || page === 'Infrastructure') {
+      void loadCloudMetrics()
+    }
+
+    if (page === 'Deployments') {
+      void loadWorkflows()
     }
   }
 
@@ -221,6 +291,12 @@ function App() {
 
     return () => window.clearInterval(intervalId)
   }, [])
+
+  useEffect(() => {
+    if (page === 'Deployments') {
+      void loadWorkflows()
+    }
+  }, [page])
 
   const navItems: { label: Page; icon: typeof LayoutDashboard }[] = [
     { label: 'Overview', icon: LayoutDashboard },
@@ -348,14 +424,7 @@ function App() {
               </p>
             </div>
 
-            <button
-              className="refresh-button"
-              onClick={() => {
-                void checkHealth()
-                void loadTasks()
-                void loadCloudMetrics()
-              }}
-            >
+            <button className="refresh-button" onClick={() => void refreshCurrentPage()}>
               <RefreshCw size={15} /> Refresh data
             </button>
           </div>
@@ -405,29 +474,10 @@ function App() {
                 <MetricCard
                   icon={<Activity size={19} />}
                   label="Application health"
-                  value={
-                    apiStatus === 'checking'
-                      ? 'Checking'
-                      : apiStatus === 'online'
-                        ? 'Healthy'
-                        : 'Offline'
-                  }
-                  detail={
-                    apiStatus === 'online'
-                      ? 'Flask API responding'
-                      : apiStatus === 'offline'
-                        ? 'API connection failed'
-                        : 'Checking /health'
-                  }
-                  tone={
-                    apiStatus === 'online'
-                      ? 'green'
-                      : apiStatus === 'offline'
-                        ? 'red'
-                        : 'neutral'
-                  }
+                  value={apiStatus === 'checking' ? 'Checking' : apiStatus === 'online' ? 'Healthy' : 'Offline'}
+                  detail={apiStatus === 'online' ? 'Flask API responding' : apiStatus === 'offline' ? 'API connection failed' : 'Checking /health'}
+                  tone={apiStatus === 'online' ? 'green' : apiStatus === 'offline' ? 'red' : 'neutral'}
                 />
-
                 <MetricCard
                   icon={<ListTodo size={19} />}
                   label="Total tasks"
@@ -435,7 +485,6 @@ function App() {
                   detail={`${completed} completed · ${tasks.length - completed} remaining`}
                   tone="sage"
                 />
-
                 <MetricCard
                   icon={<Cpu size={19} />}
                   label="CPU utilization"
@@ -443,7 +492,6 @@ function App() {
                   detail="Live CloudWatch metric"
                   tone="blue"
                 />
-
                 <MetricCard
                   icon={<ShieldCheck size={19} />}
                   label="High CPU alarm"
@@ -453,9 +501,7 @@ function App() {
                 />
               </section>
 
-              {metricsError && (
-                <div className="error-message">{metricsError}</div>
-              )}
+              {metricsError && <div className="error-message">{metricsError}</div>}
 
               <section className="content-grid">
                 <div className="panel chart-panel">
@@ -474,10 +520,7 @@ function App() {
 
                   <div className="chart-area">
                     <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart
-                        data={chartData}
-                        margin={{ top: 8, right: 6, left: -22, bottom: 0 }}
-                      >
+                      <AreaChart data={chartData} margin={{ top: 8, right: 6, left: -22, bottom: 0 }}>
                         <defs>
                           <linearGradient id="cpuFill" x1="0" y1="0" x2="0" y2="1">
                             <stop offset="0%" stopColor="#416b59" stopOpacity={0.2} />
@@ -488,63 +531,21 @@ function App() {
                             <stop offset="95%" stopColor="#c7a66a" stopOpacity={0} />
                           </linearGradient>
                         </defs>
-
-                        <CartesianGrid
-                          stroke="#e9e8e1"
-                          strokeDasharray="3 5"
-                          vertical={false}
-                        />
-                        <XAxis
-                          dataKey="time"
-                          tick={{ fontSize: 11, fill: '#8c938a' }}
-                          axisLine={false}
-                          tickLine={false}
-                        />
-                        <YAxis
-                          domain={[0, 100]}
-                          tick={{ fontSize: 11, fill: '#8c938a' }}
-                          axisLine={false}
-                          tickLine={false}
-                        />
-                        <Tooltip
-                          contentStyle={{
-                            borderRadius: 10,
-                            border: '1px solid #e5e4dc',
-                            fontSize: 12,
-                          }}
-                        />
-                        <Area
-                          type="monotone"
-                          dataKey="cpu"
-                          name="CPU (%)"
-                          connectNulls={false}
-                          stroke="#416b59"
-                          strokeWidth={2}
-                          fill="url(#cpuFill)"
-                        />
-                        <Area
-                          type="monotone"
-                          dataKey="memory"
-                          name="Memory (%)"
-                          connectNulls={false}
-                          stroke="#c7a66a"
-                          strokeWidth={2}
-                          fill="url(#memoryFill)"
-                        />
+                        <CartesianGrid stroke="#e9e8e1" strokeDasharray="3 5" vertical={false} />
+                        <XAxis dataKey="time" tick={{ fontSize: 11, fill: '#8c938a' }} axisLine={false} tickLine={false} />
+                        <YAxis domain={[0, 100]} tick={{ fontSize: 11, fill: '#8c938a' }} axisLine={false} tickLine={false} />
+                        <Tooltip contentStyle={{ borderRadius: 10, border: '1px solid #e5e4dc', fontSize: 12 }} />
+                        <Area type="monotone" dataKey="cpu" name="CPU (%)" connectNulls={false} stroke="#416b59" strokeWidth={2} fill="url(#cpuFill)" />
+                        <Area type="monotone" dataKey="memory" name="Memory (%)" connectNulls={false} stroke="#c7a66a" strokeWidth={2} fill="url(#memoryFill)" />
                       </AreaChart>
                     </ResponsiveContainer>
                   </div>
 
                   <div className="chart-note">
                     <span className="note-dot" />
-                    {metricsError ||
-                      (chartData.length
-                        ? `Last updated ${
-                            cloudMetrics
-                              ? new Date(cloudMetrics.timestamp).toLocaleTimeString()
-                              : 'recently'
-                          } · refreshes every 60 seconds.`
-                        : 'Waiting for the first live CloudWatch reading. No sample values are shown.')}
+                    {metricsError || (chartData.length
+                      ? `Last updated ${cloudMetrics ? new Date(cloudMetrics.timestamp).toLocaleTimeString() : 'recently'} · refreshes every 60 seconds.`
+                      : 'Waiting for the first live CloudWatch reading. No sample values are shown.')}
                   </div>
                 </div>
 
@@ -554,10 +555,7 @@ function App() {
                       <h3>Project activity</h3>
                       <p>Configured project capabilities</p>
                     </div>
-                    <button
-                      className="text-action"
-                      onClick={() => setPage('Deployments')}
-                    >
+                    <button className="text-action" onClick={() => setPage('Deployments')}>
                       View all <ArrowUpRight size={14} />
                     </button>
                   </div>
@@ -623,18 +621,13 @@ function App() {
                       <div className={`task-check ${task.completed ? 'task-done' : ''}`}>
                         {task.completed && <CheckCircle2 size={17} />}
                       </div>
-                      <span className={task.completed ? 'task-title-done' : ''}>
-                        {task.title}
-                      </span>
+                      <span className={task.completed ? 'task-title-done' : ''}>{task.title}</span>
                       <span className={`task-status ${task.completed ? 'status-done' : ''}`}>
                         {task.completed ? 'Completed' : 'In progress'}
                       </span>
                     </div>
                   ))}
-
-                  {tasks.length === 0 && (
-                    <p className="empty-state">No tasks yet. Add your first task above.</p>
-                  )}
+                  {tasks.length === 0 && <p className="empty-state">No tasks yet. Add your first task above.</p>}
                 </div>
               )}
 
@@ -652,48 +645,21 @@ function App() {
                   <strong>AWS infrastructure</strong>
                   <p>
                     Live metrics are retrieved from CloudWatch in us-east-1.{' '}
-                    {metricsError ||
-                      (cloudMetrics
-                        ? `Last API reading: ${new Date(cloudMetrics.timestamp).toLocaleString()}.`
-                        : 'Waiting for the first CloudWatch response.')}
+                    {metricsError || (cloudMetrics
+                      ? `Last API reading: ${new Date(cloudMetrics.timestamp).toLocaleString()}.`
+                      : 'Waiting for the first CloudWatch response.')}
                   </p>
                 </div>
               </div>
 
               <section className="metrics-grid infra-metrics">
-                <MetricCard
-                  icon={<Cpu size={19} />}
-                  label="CPU utilization"
-                  value={formatPercent(cloudMetrics?.cpu_percent)}
-                  detail="CloudWatch Agent · CPU busy"
-                  tone="sage"
-                />
-                <MetricCard
-                  icon={<Activity size={19} />}
-                  label="Memory usage"
-                  value={formatPercent(cloudMetrics?.memory_percent)}
-                  detail="mem_used_percent"
-                  tone="blue"
-                />
-                <MetricCard
-                  icon={<HardDrive size={19} />}
-                  label="Disk utilization"
-                  value={formatPercent(cloudMetrics?.disk_percent)}
-                  detail="disk_used_percent"
-                  tone="gold"
-                />
-                <MetricCard
-                  icon={<ShieldCheck size={19} />}
-                  label="High CPU alarm"
-                  value={getAlarmState(cloudMetrics)}
-                  detail={cloudMetrics?.alarms[0]?.name ?? 'CloudWatch alarm'}
-                  tone={getAlarmTone(cloudMetrics)}
-                />
+                <MetricCard icon={<Cpu size={19} />} label="CPU utilization" value={formatPercent(cloudMetrics?.cpu_percent)} detail="CloudWatch Agent · CPU busy" tone="sage" />
+                <MetricCard icon={<Activity size={19} />} label="Memory usage" value={formatPercent(cloudMetrics?.memory_percent)} detail="mem_used_percent" tone="blue" />
+                <MetricCard icon={<HardDrive size={19} />} label="Disk utilization" value={formatPercent(cloudMetrics?.disk_percent)} detail="disk_used_percent" tone="gold" />
+                <MetricCard icon={<ShieldCheck size={19} />} label="High CPU alarm" value={getAlarmState(cloudMetrics)} detail={cloudMetrics?.alarms[0]?.name ?? 'CloudWatch alarm'} tone={getAlarmTone(cloudMetrics)} />
               </section>
 
-              {metricsError && (
-                <div className="error-message">{metricsError}</div>
-              )}
+              {metricsError && <div className="error-message">{metricsError}</div>}
 
               <div className="panel infra-details">
                 <div className="panel-header">
@@ -702,7 +668,6 @@ function App() {
                     <p>Current deployment configuration</p>
                   </div>
                 </div>
-
                 <InfoRow label="Cloud provider" value="Amazon Web Services" />
                 <InfoRow label="Region" value="us-east-1 · N. Virginia" />
                 <InfoRow label="Compute" value="EC2 · t3.micro" />
@@ -719,38 +684,83 @@ function App() {
                 <div className="deploy-summary-icon"><GitBranch size={21} /></div>
                 <div>
                   <strong>GitHub Actions CI/CD</strong>
-                  <p>Push to master triggers tests, image build, and EC2 deployment.</p>
+                  <p>Live workflow history from your private CloudDeploy repository.</p>
                 </div>
                 <span className="configured-pill">
-                  <CheckCircle2 size={14} /> Configured
+                  <CheckCircle2 size={14} /> Connected
                 </span>
               </div>
 
               <div className="panel deployment-panel">
                 <div className="panel-header">
                   <div>
-                    <h3>Deployment workflow</h3>
-                    <p>Configured pipeline stages</p>
+                    <h3>Workflow runs</h3>
+                    <p>
+                      {workflowTotal} total runs · branch master
+                      {lastWorkflowUpdate && (
+                        <> · Updated {new Date(lastWorkflowUpdate).toLocaleTimeString()}</>
+                      )}
+                    </p>
                   </div>
-                  <span className="task-total">3 stages</span>
+                  <button
+                    className="secondary-button"
+                    onClick={() => void loadWorkflows()}
+                    disabled={workflowsLoading}
+                  >
+                    <RefreshCw size={15} className={workflowsLoading ? 'spin' : ''} />
+                    {workflowsLoading ? 'Refreshing…' : 'Refresh runs'}
+                  </button>
                 </div>
 
-                {[
-                  ['01', 'Source checkout', 'GitHub repository · master branch', 'Complete'],
-                  ['02', 'Test & Docker build', 'Python 3.13 · Pytest · Docker', 'Configured'],
-                  ['03', 'Deploy to EC2', 'SCP + SSH · commit-tagged image', 'Configured'],
-                ].map(([number, title, detail, status]) => (
-                  <div className="deployment-step" key={number}>
-                    <div className="step-number">{number}</div>
-                    <div className="step-copy">
-                      <strong>{title}</strong>
-                      <span>{detail}</span>
-                    </div>
-                    <span className="step-status">
-                      <CheckCircle2 size={14} /> {status}
-                    </span>
+                {workflowsError && (
+                  <div className="error-message">
+                    <AlertCircle size={17} /> {workflowsError}
                   </div>
-                ))}
+                )}
+
+                {workflowsLoading && workflowRuns.length === 0 ? (
+                  <p className="empty-state">Loading GitHub Actions runs…</p>
+                ) : workflowRuns.length > 0 ? (
+                  <div className="workflow-list">
+                    {workflowRuns.map((run) => (
+                      <div className="deployment-step workflow-run" key={run.id}>
+                        <div className={`step-number ${getWorkflowTone(run)}`}>
+                          {getWorkflowIcon(run)}
+                        </div>
+
+                        <div className="step-copy workflow-copy">
+                          <strong>
+                            Run #{run.run_number}: {run.name}
+                          </strong>
+                          <span>
+                            Branch: {run.branch || 'unknown'} · Commit: {run.commit || 'unknown'}
+                          </span>
+                          <span>
+                            <Clock size={13} />
+                            {' '}{formatDate(run.created_at)}
+                          </span>
+                        </div>
+
+                        <span className={`workflow-status ${getWorkflowTone(run)}`}>
+                          {getWorkflowStatus(run)}
+                        </span>
+
+                        <a
+                          className="workflow-open"
+                          href={run.html_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          aria-label={`Open workflow run ${run.run_number} on GitHub`}
+                          title="Open on GitHub"
+                        >
+                          <ExternalLink size={16} />
+                        </a>
+                      </div>
+                    ))}
+                  </div>
+                ) : !workflowsLoading && !workflowsError ? (
+                  <p className="empty-state">No workflow runs were returned by GitHub.</p>
+                ) : null}
 
                 <a
                   className="github-link"
@@ -758,15 +768,15 @@ function App() {
                   target="_blank"
                   rel="noreferrer"
                 >
-                  Open GitHub Actions <ExternalLink size={15} />
+                  Open all GitHub Actions <ExternalLink size={15} />
                 </a>
               </div>
 
               <div className="deployment-note">
                 <Code2 size={17} />
                 <span>
-                  This page shows the configured pipeline. Live workflow history
-                  is not connected to the GitHub API.
+                  Workflow history is retrieved from GitHub's API through the Flask backend.
+                  The GitHub token stays on the backend and is not exposed to the browser.
                 </span>
               </div>
             </>
@@ -790,6 +800,53 @@ function App() {
   )
 }
 
+function getWorkflowStatus(run: WorkflowRun) {
+  if (run.status !== 'completed') {
+    return run.status === 'in_progress'
+      ? 'In progress'
+      : run.status === 'queued'
+        ? 'Queued'
+        : run.status || 'Unknown'
+  }
+
+  switch (run.conclusion) {
+    case 'success':
+      return 'Success'
+    case 'failure':
+      return 'Failed'
+    case 'cancelled':
+      return 'Cancelled'
+    case 'timed_out':
+      return 'Timed out'
+    case 'skipped':
+      return 'Skipped'
+    case 'action_required':
+      return 'Action required'
+    default:
+      return run.conclusion || 'Completed'
+  }
+}
+
+function getWorkflowTone(run: WorkflowRun) {
+  if (run.status !== 'completed') return 'running'
+  if (run.conclusion === 'success') return 'success'
+  if (run.conclusion === 'failure' || run.conclusion === 'timed_out') return 'failure'
+  if (run.conclusion === 'cancelled' || run.conclusion === 'skipped') return 'neutral'
+  return 'neutral'
+}
+
+function getWorkflowIcon(run: WorkflowRun) {
+  if (run.status !== 'completed') return <Clock size={17} />
+  if (run.conclusion === 'success') return <CheckCircle2 size={17} />
+  if (run.conclusion === 'failure') return <AlertCircle size={17} />
+  return <Code2 size={17} />
+}
+
+function formatDate(value: string) {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? 'Date unavailable' : date.toLocaleString()
+}
+
 function formatPercent(value: number | null | undefined) {
   return typeof value === 'number' && Number.isFinite(value)
     ? `${value.toFixed(2)}%`
@@ -803,10 +860,8 @@ function getAlarmState(metrics: CloudWatchMetrics | null) {
 
 function getAlarmTone(metrics: CloudWatchMetrics | null) {
   const state = metrics?.alarms[0]?.state
-
   if (state === 'OK') return 'green'
   if (state === 'ALARM') return 'red'
-
   return 'neutral'
 }
 
@@ -817,7 +872,7 @@ function MetricCard({
   detail,
   tone,
 }: {
-  icon: React.ReactNode
+  icon: ReactNode
   label: string
   value: string
   detail: string

@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import boto3
+import requests
 from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, jsonify, request, send_from_directory
 
@@ -27,6 +28,11 @@ CLOUDWATCH_HOST = os.environ.get(
     "ip-172-31-31-204.ec2.internal"
 )
 CLOUDWATCH_ALARM_NAME = "CloudDeploy-HighCPU"
+
+GITHUB_API_URL = (
+    "https://api.github.com/repos/"
+    "divyanshibhagi2005-debug/CloudDeploy/actions/runs"
+)
 
 cloudwatch = boto3.client("cloudwatch", region_name=AWS_REGION)
 
@@ -83,7 +89,11 @@ def import_tasks_from_json(backup_path):
             )
 
 
-def get_latest_metric(metric_name, dimensions, namespace=CLOUDWATCH_NAMESPACE):
+def get_latest_metric(
+    metric_name,
+    dimensions,
+    namespace=CLOUDWATCH_NAMESPACE
+):
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=30)
 
@@ -102,7 +112,11 @@ def get_latest_metric(metric_name, dimensions, namespace=CLOUDWATCH_NAMESPACE):
     if not datapoints:
         return None
 
-    latest = max(datapoints, key=lambda point: point["Timestamp"])
+    latest = max(
+        datapoints,
+        key=lambda point: point["Timestamp"]
+    )
+
     return round(latest["Average"], 2)
 
 
@@ -114,6 +128,7 @@ def get_metric_dimensions(metric_name):
 
     for metric in response.get("Metrics", []):
         dimensions = metric.get("Dimensions", [])
+
         dimension_values = {
             dimension["Name"]: dimension["Value"]
             for dimension in dimensions
@@ -181,7 +196,9 @@ def add_task():
         or not isinstance(data.get("title"), str)
         or not data["title"].strip()
     ):
-        return jsonify({"error": "A valid task title is required"}), 400
+        return jsonify({
+            "error": "A valid task title is required"
+        }), 400
 
     title = data["title"].strip()
 
@@ -220,7 +237,12 @@ def get_cloudwatch_metrics():
             cpu_dimensions
         )
 
-        cpu = round(100 - idle_cpu, 2) if idle_cpu is not None else None
+        cpu = (
+            round(100 - idle_cpu, 2)
+            if idle_cpu is not None
+            else None
+        )
+
         disk = get_disk_metric()
 
         alarm_response = cloudwatch.describe_alarms(
@@ -252,6 +274,80 @@ def get_cloudwatch_metrics():
         return jsonify({
             "status": "error",
             "message": "Unable to retrieve CloudWatch metrics"
+        }), 502
+
+
+@app.route("/github/workflows", methods=["GET"])
+def github_workflows():
+    token = os.environ.get("GITHUB_TOKEN")
+
+    if not token:
+        return jsonify({
+            "status": "error",
+            "message": "GitHub token is not configured"
+        }), 503
+
+    try:
+        response = requests.get(
+            GITHUB_API_URL,
+            params={
+                "per_page": 10,
+                "branch": "master"
+            },
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28"
+            },
+            timeout=10
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+        runs = []
+
+        for run in data.get("workflow_runs", []):
+            runs.append({
+                "id": run["id"],
+                "name": (
+                    run.get("display_title")
+                    or run.get("name")
+                    or "GitHub Actions workflow"
+                ),
+                "status": run.get("status"),
+                "conclusion": run.get("conclusion"),
+                "branch": run.get("head_branch"),
+                "commit": (run.get("head_sha") or "")[:7],
+                "html_url": run.get("html_url"),
+                "created_at": run.get("created_at"),
+                "updated_at": run.get("updated_at"),
+                "run_number": run.get("run_number")
+            })
+
+        return jsonify({
+            "status": "success",
+            "total_count": data.get("total_count", 0),
+            "workflow_runs": runs
+        })
+
+    except requests.RequestException as error:
+        app.logger.error(
+            "GitHub Actions API request failed: %s",
+            error
+        )
+
+        return jsonify({
+            "status": "error",
+            "message": "Unable to retrieve GitHub Actions runs"
+        }), 502
+
+    except (ValueError, KeyError):
+        app.logger.exception("Unexpected GitHub Actions API response")
+
+        return jsonify({
+            "status": "error",
+            "message": "Invalid response from GitHub"
         }), 502
 
 
